@@ -157,20 +157,16 @@ if __name__ == '__main__':
         print(f"  {img}")
     
     images = [cv.imread(path) for path in img_names]
-    w,h = images[0].shape[1], images[0].shape[0]
-
-    # 이미지 크기 조정을 위한 스케일 계산
-    # work_megapix가 None이면 원본 크기(1.0), 아니면 지정된 메가픽셀에 맞게 스케일 조정
+    w,h = images[0].shape[1], images[0].shape[0]    # Calculate scale for image resizing
+    # If work_megapix is None, use original size (1.0), otherwise scale to specified megapixels
     work_scale = 1 if work_megapix is None else min(1.0, np.sqrt(work_megapix * 1e6 / (w * h)))
-    # seam_megapix가 None이면 원본 크기(1.0), 아니면 지정된 메가픽셀에 맞게 스케일 조정
+    # If seam_megapix is None, use original size (1.0), otherwise scale to specified megapixels
     seam_scale = 1.0 if seam_megapix is None else min(1.0, np.sqrt(seam_megapix * 1e6 / (w * h)))
-    seam_work_aspect = seam_scale / work_scale
-
-    # 모든 이미지에서 feature 구함
+    seam_work_aspect = seam_scale / work_scale    # Extract features from all images
     features = get_features_All(images, feature_detector=feature_detector, work_scale=work_scale)
     images = [cv.resize(src=img, dsize=None, fx=seam_scale, fy=seam_scale, interpolation=cv.INTER_LINEAR_EXACT) for img in images]
 
-    # 모든 feature 간의 매칭 수행
+    # Perform matching between all features
     matches = match_all(features)
     matches = [matches[i][j] for i in range(len(images)) for j in range(len(images))]
     for i, match in enumerate(matches):
@@ -178,55 +174,47 @@ if __name__ == '__main__':
               f"Num_matches: {len(match.matches):3d}, "
               f"Confidence: {match.confidence:.5f}, "
               f"Num_inliers: {sum(match.inliers_mask):2d}")
-
-
-    # 매칭 그래프 구조를 문자열 형태로 출력 (디버깅 목적), Reverse Engineering cv.detail.matchesGraphAsString function
+    # Output matching graph structure as string (for debugging), Reverse Engineering cv.detail.matchesGraphAsString function
     print(matchesGraphAsString(img_names, matches, conf_thresh))
-    # 가장 큰 연결된 컴포넌트(이미지 군집)를 남기고 나머지는 필터링, Reverse Engineering cv.detail.leaveBiggestComponent function
+    # Filter to keep the largest connected component (image cluster), Reverse Engineering cv.detail.leaveBiggestComponent function
     indices = leaveBiggestComponent(features, matches, conf_thresh)
     images = [images[i] for i in indices]
     img_names = [img_names[i] for i in indices]
     num_images = len(img_names)
     print(indices)
-    print(img_names)
-
-    # 필터링했을때 이미지가 너무 적으면 중단
+    print(img_names)    # Stop if too few images after filtering
     if num_images < 2:
         print("Need more images")
         exit()
     
     # Reverse Engineering OpenCV cv.detail_BestOf2NearestMatcher function
-    # estimate_focal : Image of the Absolute Conic 을 이용헤 homography matrix 로부터터 focal length 추정.
-    # find_max_spanning_tree : 최대 신장 트리(Maximum Spanning Tree, MST)를 크루스칼 알고리즘(Kruskal's Algorithm) 이용해 찾고 중심 노드(이미지)를 찾음.
-    # propagation: 중심노드드에서부터 인접한 이웃 노드를 BFS order대로 방문하며 카메라의 회전 행렬 R을 트리(그래프) 형태로 전파(propagation)
-    cameras = homography_based_estimate(features, matches)
-
-    # 회전 행렬(R)을 float32로 캐스팅하여 후속 OpenCV 연산 호환성 확보
+    # estimate_focal : Estimate focal length from homography matrix using Image of the Absolute Conic
+    # find_max_spanning_tree : Find Maximum Spanning Tree (MST) using Kruskal's Algorithm and find center node (image)
+    # propagation: Propagate camera rotation matrix R from center node to adjacent neighbor nodes in BFS order in tree (graph) structure
+    cameras = homography_based_estimate(features, matches)    # Cast rotation matrices (R) to float32 for subsequent OpenCV operation compatibility
     for cam in cameras:
         cam.R = cam.R.astype(np.float32)
 
-    # Bundle Adjustment (BA) 최적화 객체 생성 및 설정
-    adjuster = BA_COST_CHOICES[args.ba]()  # 'ray', 'reproj', 'affine', 'no' 등 선택
-    adjuster.setConfThresh(conf_thresh)    # 일치도 임계값 설정
+    # Create and configure Bundle Adjustment (BA) optimization object
+    adjuster = BA_COST_CHOICES[args.ba]()  # Select from 'ray', 'reproj', 'affine', 'no'
+    adjuster.setConfThresh(conf_thresh)    # Set confidence threshold
 
-    # BA에서 어떤 파라미터를 최적화할지 결정하는 마스크 생성
+    # Create mask to determine which parameters to optimize in BA
     refine_mask = np.zeros((3, 3), np.uint8)
-    # ba_refine_mask 문자열 예: 'x_xxx'. 'x'는 최적화, '_'는 고정
+    # ba_refine_mask string example: 'x_xxx'. 'x' means optimize, '_' means fix
     # (0,0): focal length, (0,1): skew/aspect, (0,2): principal point,
     # (1,1): rotation, (1,2): translation
     refine_indices = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2)]
     for i, (r, c) in enumerate(refine_indices):
         if args.ba_refine_mask[i] == 'x':
             refine_mask[r, c] = 1
-    adjuster.setRefinementMask(refine_mask)
-
-    # BA 최적화 수행: features, match 정보 p, 초기 카메라 파라미터
+    adjuster.setRefinementMask(refine_mask)    # Perform BA optimization: features, match information, initial camera parameters
     success, cameras = adjuster.apply(features, matches, cameras)
     if not success:
         print("Camera parameters adjusting failed.")
         exit()
 
-    # 최적화된 카메라의 focal 값만 추출하여 중앙값 기반의 warped image scale 결정
+    # Extract only focal values from optimized cameras to determine warped image scale based on median
     focals = sorted([cam.focal for cam in cameras])
     if len(focals) % 2 == 1:
         warped_image_scale = focals[len(focals) // 2]
@@ -234,77 +222,73 @@ if __name__ == '__main__':
         mid = len(focals) // 2
         warped_image_scale = (focals[mid] + focals[mid - 1]) / 2
 
-    # Wave correction (수평/수직 보정) 적용
+    # Apply wave correction (horizontal/vertical correction)
     if wave_correct is not None:
-        # 각 카메라의 회전 행렬 복사
+        # Copy rotation matrix of each camera
         rmats = [np.copy(cam.R) for cam in cameras]
-        # 보정된 회전 행렬 획득
+        # Get corrected rotation matrices
         rmats = cv.detail.waveCorrect(rmats, wave_correct)
-        # 원본 카메라 객체에 보정된 회전 행렬 적용
+        # Apply corrected rotation matrices to original camera objects
         for idx, cam in enumerate(cameras):
             cam.R = rmats[idx]
 
-    # 이후 이미지 워핑 및 마스크 생성 준비
+    # Prepare for subsequent image warping and mask generation
     corners = []
     masks_warped = []
     images_warped = []
     sizes = []
-    masks = []
-
-    # 각 이미지에 대한 binary 마스크 생성 (전부 흰색)
+    masks = []    # Generate binary mask for each image (all white)
     for img in images:
         mask = cv.UMat(255 * np.ones((img.shape[0], img.shape[1]), np.uint8))
         masks.append(mask)
 
-    # PyRotationWarper 객체 생성 (워핑 방식 및 스케일 지정)
+    # Create PyRotationWarper object (specify warping method and scale)
     warper = cv.PyRotationWarper(warp_type, warped_image_scale * seam_work_aspect)
     for idx, img in enumerate(images):
-        # 카메라 내부 파라미터(K) 가져와 스케일 적용
+        # Get camera intrinsic parameters (K) and apply scale
         K = cameras[idx].K().astype(np.float32)
         K[0, 0] *= seam_work_aspect
         K[0, 2] *= seam_work_aspect
         K[1, 1] *= seam_work_aspect
         K[1, 2] *= seam_work_aspect
 
-        # 이미지 워핑: 회전 행렬 R과 K를 사용하여 warped image, 그리고 offset(corner) 반환
+        # Image warping: return warped image and offset (corner) using rotation matrix R and K
         corner, image_wp = warper.warp(img, K, cameras[idx].R, cv.INTER_LINEAR, cv.BORDER_REFLECT)
         corners.append(corner)
         sizes.append((image_wp.shape[1], image_wp.shape[0]))  # (width, height)
         images_warped.append(image_wp)
 
-        # 마스크도 동일하게 워핑 (이진 마스크이므로 INTER_NEAREST)
+        # Warp mask similarly (use INTER_NEAREST for binary mask)
         _, mask_wp = warper.warp(masks[idx], K, cameras[idx].R, cv.INTER_NEAREST, cv.BORDER_CONSTANT)
-        masks_warped.append(mask_wp.get())  # UMat -> numpy 배열로 변환
+        masks_warped.append(mask_wp.get())  # Convert UMat -> numpy array
 
-    # float32 타입으로 변환된 warped images 리스트 생성 (seam finder에 사용)
+    # Generate list of warped images converted to float32 type (for use in seam finder)
     images_warped_f = [img.astype(np.float32) for img in images_warped]
 
-    # Exposure compensator 객체 가져와 feed (보정 적용 준비)
+    # Get exposure compensator object and feed (prepare for compensation application)
     compensator = get_compensator(args)
     compensator.feed(corners=corners, images=images_warped, masks=masks_warped)
 
-    # Seam finder 적용: 워핑된 이미지와 마스크를 인자로 seam 마스크 계산
+    # Apply seam finder: calculate seam mask using warped images and masks as arguments
     seam_finder = SEAM_FIND_CHOICES[args.seam]
-    masks_warped = seam_finder.find(images_warped_f, corners, masks_warped)
-
-    # Composition 단계 준비
+    masks_warped = seam_finder.find(images_warped_f, corners, masks_warped)    # Composition stage preparation
     compose_scale = 1.0
     corners = []
     sizes = []
     blender = None
 
-    # compose_scale 계산 및 warper, 카메라 파라미터 보정
+    # Calculate compose_scale and correct warper, camera parameters
     if compose_megapix > 0:
         compose_scale = min(1.0, np.sqrt(compose_megapix * 1e6 / (w * h)))
     compose_work_aspect = compose_scale / work_scale
     warped_image_scale *= compose_work_aspect
     warper = cv.PyRotationWarper(warp_type, warped_image_scale)
-    # 각 카메라 K, focal, principal point 좌표를 compose 스케일에 맞게 업데이트
+    # Update each camera K, focal, principal point coordinates to match compose scale
     for cam in cameras:
         cam.focal *= compose_work_aspect
         cam.ppx *= compose_work_aspect
         cam.ppy *= compose_work_aspect
-    # 각 이미지 ROI(Region of Interest) 및 크기 계산
+    # Calculate each image ROI (Region of Interest) and size
     for cam in cameras:
         K = cam.K().astype(np.float32)
         roi = warper.warpRoi((int(round(w * compose_scale)), int(round(h * compose_scale))), K, cam.R)
@@ -312,36 +296,34 @@ if __name__ == '__main__':
         sizes.append(roi[2:4])
 
         
-    # 최종 compositing 단계: 원본 이미지를 사용하여 블렌딩
+    # Final compositing stage: blend using original images
     for idx, name in enumerate(img_names):
-        full_img = cv.imread(name)
-
-        # compose_scale이 1이 아닌 경우 이미지를 리사이즈
+        full_img = cv.imread(name)        # Resize image if compose_scale is not 1
         if abs(compose_scale - 1) > 1e-1:
             img = cv.resize(full_img, None, fx=compose_scale, fy=compose_scale, interpolation=cv.INTER_LINEAR_EXACT)
         else:
             img = full_img
 
-        # 워핑 수행
+        # Perform warping
         K = cameras[idx].K().astype(np.float32)
         corner, image_warped = warper.warp(img, K, cameras[idx].R, cv.INTER_LINEAR, cv.BORDER_REFLECT)
-        # 워핑된 마스크 생성
+        # Generate warped mask
         mask = 255 * np.ones((img.shape[0], img.shape[1]), np.uint8)
         _, mask_warped = warper.warp(mask, K, cameras[idx].R, cv.INTER_NEAREST, cv.BORDER_CONSTANT)
 
-        # Exposure compensation 적용
+        # Apply exposure compensation
         compensator.apply(idx, corners[idx], image_warped, mask_warped)
 
-        # int16 타입으로 변환 후 블렌더에 feed
+        # Convert to int16 type and feed to blender
         image_warped_s = image_warped.astype(np.int16)
-        # 탐지된 seam 영역 확대하여 블렌딩 마스크 생성
+        # Expand detected seam area to create blending mask
         dilated_mask = cv.dilate(masks_warped[idx], None)
         seam_mask = cv.resize(dilated_mask, (mask_warped.shape[1], mask_warped.shape[0]), interpolation=cv.INTER_LINEAR_EXACT)
         mask_warped = cv.bitwise_and(seam_mask, mask_warped)
 
-        # Blender 객체가 아직 생성되지 않았다면 최초 생성 및 준비
+        # Create and prepare blender object if not yet created
         if blender is None:
-            # 최종 결과 영역 계산
+            # Calculate final result area
             dst_sz = cv.detail.resultRoi(corners=corners, sizes=sizes)
             blend_width = np.sqrt(dst_sz[2] * dst_sz[3]) * args.blend_strength / 100
             if blend_width < 1 or blend_type == "no":
@@ -355,13 +337,13 @@ if __name__ == '__main__':
                 blender.setSharpness(1.0 / blend_width)
             blender.prepare(dst_sz)
 
-        # 블렌더에 워핑된 이미지, 마스크, 좌표 전달
+        # Pass warped image, mask, coordinates to blender
         blender.feed(cv.UMat(image_warped_s), mask_warped, corners[idx])
 
-    # 모든 이미지를 블렌딩하여 최종 파노라마 획득
+    # Blend all images to obtain final panorama
     result, result_mask = blender.blend(None, None)
 
-    # 결과 영상 저장 및 화면에 표시
+    # Save result image and display on screen
     cv.imwrite(args.output, result)
     zoom_x = 600.0 / result.shape[1]
     dst = cv.normalize(result, None, alpha=255.0, norm_type=cv.NORM_MINMAX, dtype=cv.CV_8U)
